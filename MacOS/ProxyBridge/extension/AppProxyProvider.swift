@@ -1,4 +1,5 @@
 import NetworkExtension
+import Darwin  // For audit_token_t, audit_token_to_pid, proc_pidpath, PROC_PIDPATHINFO_MAXSIZE
 
 enum RuleProtocol: String, Codable {
     case tcp = "TCP"
@@ -218,7 +219,21 @@ class AppProxyProvider: NETransparentProxyProvider {
         logQueueLock.unlock()
     }
     
-    // Helper function to extract process executable path from audit token
+    /// Extracts the executable path of a process from its audit token.
+    ///
+    /// This function uses the audit token to get the process ID (PID), then retrieves
+    /// the full path to the process executable using proc_pidpath().
+    ///
+    /// - Parameter auditToken: The audit token data from NEFlowMetaData.sourceAppAuditToken
+    /// - Returns: The full path to the process executable, or nil if:
+    ///   - The audit token size is invalid
+    ///   - The process no longer exists
+    ///   - The calling process lacks permission to access the process information
+    ///   - proc_pidpath() fails for any other reason
+    ///
+    /// - Note: This is a workaround for Apple's Network Extension API limitation that doesn't
+    ///         provide direct access to process names or paths. It may fail in some edge cases
+    ///         due to security restrictions or race conditions.
     private func getProcessPath(from auditToken: Data) -> String? {
         guard auditToken.count == MemoryLayout<audit_token_t>.size else {
             return nil
@@ -231,7 +246,7 @@ class AppProxyProvider: NETransparentProxyProvider {
         
         let pid = audit_token_to_pid(token)
         
-        let pathBufferSize = Int(PROC_PIDPATHINFO_MAXSIZE)
+        let pathBufferSize = Int(PROC_PIDPATHINFO_MAXSIZE)  // From Darwin module
         var pathBuffer = [CChar](repeating: 0, count: pathBufferSize)
         
         let result = pathBuffer.withUnsafeMutableBufferPointer { bufferPtr in
@@ -245,8 +260,20 @@ class AppProxyProvider: NETransparentProxyProvider {
         return String(cString: pathBuffer)
     }
     
-    // Helper function to extract process identifier from NEFlowMetaData
-    // Returns both the bundle ID (if available) and the executable path
+    /// Extracts process identifiers from network flow metadata.
+    ///
+    /// This function retrieves both the bundle identifier (always available) and the
+    /// executable path (when available) for the process that originated the network flow.
+    ///
+    /// - Parameter metaData: The NEFlowMetaData from the network flow
+    /// - Returns: A tuple containing:
+    ///   - bundleId: The application bundle identifier (e.g., "com.example.app") or "unknown"
+    ///   - executablePath: The full path to the executable (e.g., "/usr/local/bin/ciadpi"),
+    ///                     or nil if the path cannot be determined
+    ///
+    /// - Note: The executable path is extracted from the sourceAppAuditToken when available.
+    ///         For processes without app bundles (standalone binaries), this provides the
+    ///         only reliable way to identify the process.
     private func getProcessIdentifiers(from metaData: NEFlowMetaData) -> (bundleId: String, executablePath: String?) {
         let bundleId = metaData.sourceAppSigningIdentifier
         var executablePath: String? = nil
