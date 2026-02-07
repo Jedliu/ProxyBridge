@@ -217,6 +217,47 @@ class AppProxyProvider: NETransparentProxyProvider {
         }
         logQueueLock.unlock()
     }
+    
+    // Helper function to extract process executable path from audit token
+    private func getProcessPath(from auditToken: Data) -> String? {
+        guard auditToken.count == MemoryLayout<audit_token_t>.size else {
+            return nil
+        }
+        
+        var token = audit_token_t()
+        _ = withUnsafeMutableBytes(of: &token) { tokenPtr in
+            auditToken.copyBytes(to: tokenPtr)
+        }
+        
+        let pid = audit_token_to_pid(token)
+        
+        let pathBufferSize = Int(PROC_PIDPATHINFO_MAXSIZE)
+        var pathBuffer = [CChar](repeating: 0, count: pathBufferSize)
+        
+        let result = pathBuffer.withUnsafeMutableBufferPointer { bufferPtr in
+            proc_pidpath(pid, bufferPtr.baseAddress, UInt32(pathBufferSize))
+        }
+        
+        guard result > 0 else {
+            return nil
+        }
+        
+        return String(cString: pathBuffer)
+    }
+    
+    // Helper function to extract process identifier from NEFlowMetaData
+    // Returns both the bundle ID (if available) and the executable path
+    private func getProcessIdentifiers(from metaData: NEFlowMetaData) -> (bundleId: String, executablePath: String?) {
+        let bundleId = metaData.sourceAppSigningIdentifier
+        var executablePath: String? = nil
+        
+        // Try to get executable path from audit token if available
+        if let auditToken = metaData.sourceAppAuditToken {
+            executablePath = getProcessPath(from: auditToken)
+        }
+        
+        return (bundleId, executablePath)
+    }
 
     override func startProxy(options: [String : Any]?, completionHandler: @escaping (Error?) -> Void) {
         let settings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
@@ -447,12 +488,19 @@ class AppProxyProvider: NETransparentProxyProvider {
             portStr = "unknown"
         }
         
-        var processPath = "unknown"
+        var processIdentifier = "unknown"
+        var executablePath: String? = nil
+        
         if let metaData = flow.metaData as? NEFlowMetaData {
-            processPath = metaData.sourceAppSigningIdentifier
+            let identifiers = getProcessIdentifiers(from: metaData)
+            processIdentifier = identifiers.bundleId
+            executablePath = identifiers.executablePath
         }
         
-        if processPath == "com.interceptsuite.ProxyBridge" || processPath == "com.interceptsuite.ProxyBridge.extension" {
+        // Use executable path for logging/display if available, otherwise use bundle ID
+        let displayIdentifier = executablePath ?? processIdentifier
+        
+        if processIdentifier == "com.interceptsuite.ProxyBridge" || processIdentifier == "com.interceptsuite.ProxyBridge.extension" {
             return false
         }
         
@@ -461,16 +509,16 @@ class AppProxyProvider: NETransparentProxyProvider {
         proxyLock.unlock()
         
         if !hasProxyConfig {
-            sendLogToApp(protocol: "TCP", process: processPath, destination: destination, port: portStr, proxy: "Direct")
+            sendLogToApp(protocol: "TCP", process: displayIdentifier, destination: destination, port: portStr, proxy: "Direct")
             return false
         }
         
-        let matchedRule = findMatchingRule(processPath: processPath, destination: destination, port: portNum, connectionProtocol: .tcp, checkIpPort: true)
+        let matchedRule = findMatchingRule(bundleId: processIdentifier, executablePath: executablePath, destination: destination, port: portNum, connectionProtocol: .tcp, checkIpPort: true)
         
         if let rule = matchedRule {
             let action = rule.action.rawValue
             
-            sendLogToApp(protocol: "TCP", process: processPath, destination: destination, port: portStr, proxy: action)
+            sendLogToApp(protocol: "TCP", process: displayIdentifier, destination: destination, port: portStr, proxy: action)
             
             switch rule.action {
             case .direct:
@@ -484,18 +532,25 @@ class AppProxyProvider: NETransparentProxyProvider {
                 return true
             }
         } else {
-            sendLogToApp(protocol: "TCP", process: processPath, destination: destination, port: portStr, proxy: "Direct")
+            sendLogToApp(protocol: "TCP", process: displayIdentifier, destination: destination, port: portStr, proxy: "Direct")
             return false
         }
     }
     
     private func handleUDPFlow(_ flow: NEAppProxyUDPFlow) -> Bool {
-        var processPath = "unknown"
+        var processIdentifier = "unknown"
+        var executablePath: String? = nil
+        
         if let metaData = flow.metaData as? NEFlowMetaData {
-            processPath = metaData.sourceAppSigningIdentifier
+            let identifiers = getProcessIdentifiers(from: metaData)
+            processIdentifier = identifiers.bundleId
+            executablePath = identifiers.executablePath
         }
         
-        if processPath == "com.interceptsuite.ProxyBridge" || processPath == "com.interceptsuite.ProxyBridge.extension" {
+        // Use executable path for logging/display if available, otherwise use bundle ID
+        let displayIdentifier = executablePath ?? processIdentifier
+        
+        if processIdentifier == "com.interceptsuite.ProxyBridge" || processIdentifier == "com.interceptsuite.ProxyBridge.extension" {
             return false
         }
         
@@ -509,16 +564,16 @@ class AppProxyProvider: NETransparentProxyProvider {
             return false
         }
         
-        let matchedRule = findMatchingRule(processPath: processPath, destination: "", port: 0, connectionProtocol: .udp, checkIpPort: false)
+        let matchedRule = findMatchingRule(bundleId: processIdentifier, executablePath: executablePath, destination: "", port: 0, connectionProtocol: .udp, checkIpPort: false)
         
         if let rule = matchedRule {
             // We don't have access to UDP dest ip and port when os handles it in (apple proxy API limitation), we log with unknown ip and port to know specific package is using UDP
             switch rule.action {
             case .direct:
-                sendLogToApp(protocol: "UDP", process: processPath, destination: "unknown", port: "unknown", proxy: "Direct")
+                sendLogToApp(protocol: "UDP", process: displayIdentifier, destination: "unknown", port: "unknown", proxy: "Direct")
                 return false
             case .block:
-                sendLogToApp(protocol: "UDP", process: processPath, destination: "unknown", port: "unknown", proxy: "BLOCK")
+                sendLogToApp(protocol: "UDP", process: displayIdentifier, destination: "unknown", port: "unknown", proxy: "BLOCK")
                 return true
             case .proxy:
                 flow.open(withLocalEndpoint: nil) { [weak self] error in
@@ -530,14 +585,14 @@ class AppProxyProvider: NETransparentProxyProvider {
                     }
                     
                     if let host = socksHost, let port = socksPort {
-                        self.proxyUDPFlowViaSOCKS5(flow, processPath: processPath, socksHost: host, socksPort: port)
+                        self.proxyUDPFlowViaSOCKS5(flow, processPath: displayIdentifier, socksHost: host, socksPort: port)
                     }
                 }
                 return true
             }
         } else {
             // No rule matched let OS handle it, but log it so user knows this process is using UDP
-            sendLogToApp(protocol: "UDP", process: processPath, destination: "unknown", port: "unknown", proxy: "Direct")
+            sendLogToApp(protocol: "UDP", process: displayIdentifier, destination: "unknown", port: "unknown", proxy: "Direct")
             return false
         }
     }
@@ -1150,7 +1205,7 @@ class AppProxyProvider: NETransparentProxyProvider {
     override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
     }
     
-    private func findMatchingRule(processPath: String, destination: String, port: UInt16, connectionProtocol: RuleProtocol, checkIpPort: Bool) -> ProxyRule? {
+    private func findMatchingRule(bundleId: String, executablePath: String?, destination: String, port: UInt16, connectionProtocol: RuleProtocol, checkIpPort: Bool) -> ProxyRule? {
         rulesLock.lock()
         defer { rulesLock.unlock() }
         
@@ -1161,7 +1216,16 @@ class AppProxyProvider: NETransparentProxyProvider {
                 continue
             }
             
-            if !rule.matchesProcess(processPath) {
+            // Try matching against executable path first (if available), then bundle ID
+            var processMatched = false
+            if let execPath = executablePath {
+                processMatched = rule.matchesProcess(execPath)
+            }
+            if !processMatched {
+                processMatched = rule.matchesProcess(bundleId)
+            }
+            
+            if !processMatched {
                 continue
             }
             
